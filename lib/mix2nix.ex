@@ -55,85 +55,26 @@ defmodule Mix2nix do
     end
   end
 
-  @switches [
-    strict: [
-      lockfile: :string,
-      libfile: :string,
-      pkgfile: :string,
-      depfile: :string,
-      name: :string,
-      version: :string,
-      src: :string,
-      no_write_lib: :boolean,
-      no_write_pkg: :boolean,
-      no_write_dep: :boolean
-    ],
-    aliases: [i: :lockfile, o: :pkgfile, l: :libfile, n: :name, v: :version, s: :src, d: :depfile]
-  ]
-
   def main(args \\ []) do
-    {switches, _args} = OptionParser.parse!(args, @switches)
+    case Mix2nix.Options.from_args(args) do
+      {:error, e} ->
+        IO.puts("Error parsing command line arguments: #{e}")
+        raise R
 
-    lockfile = Keyword.get(switches, :lockfile, "mix.lock") |> Path.expand()
-    lockdir = Path.dirname(lockfile)
+      :help ->
+        IO.puts(Mix2nix.Options.help())
 
-    IO.puts("Lockfile: #{lockfile}")
+      {:ok, opts} ->
+        run(opts)
+    end
+  end
 
-    name =
-      Keyword.get_lazy(switches, :name, fn ->
-        System.cmd(
-          "mix",
-          [
-            "run",
-            "--no-compile",
-            "--no-deps-check",
-            "--no-start",
-            "-e",
-            "IO.write(Atom.to_string(Mix.Project.config()[:app]))"
-          ],
-          cd: lockdir
-        )
-        |> ensure_successful_cmd("mix run (get app name)")
-        |> String.trim()
-      end)
+  def run(opts = %Mix2nix.Options{}) do
+    locks = read_lockfile(opts.lockfile)
 
-    version =
-      Keyword.get_lazy(switches, :version, fn ->
-        System.cmd(
-          "mix",
-          [
-            "run",
-            "--no-compile",
-            "--no-deps-check",
-            "--no-start",
-            "-e",
-            "IO.write(Mix.Project.config()[:version])"
-          ],
-          cd: lockdir
-        )
-        |> ensure_successful_cmd("mix run (get app version)")
-        |> String.trim()
-      end)
-
-    pkgfile =
-      Keyword.get(switches, :pkgfile, Path.join(Path.dirname(lockfile), "#{name}.nix"))
-      |> Path.expand()
-
-    pkgdir = Path.dirname(pkgfile)
-
-    depfile =
-      Keyword.get(switches, :depfile, Path.join(Path.dirname(pkgfile), "#{name}-deps.nix"))
-      |> Path.expand()
-
-    libfile =
-      Keyword.get(switches, :libfile, Path.join(Path.dirname(pkgfile), "mix2nix-build.nix"))
-      |> Path.expand()
-
-    exe_path = Path.expand(Path.dirname(Path.dirname(:escript.script_name())))
-    lib_source = Path.join([exe_path, "share", "mix2nix-build.nix"])
-    src = Keyword.get(switches, :src, "./.")
-
-    locks = read_lockfile(lockfile)
+    exe_path = :escript.script_name() |> Path.expand() |> Path.dirname()
+    install_path = Path.dirname(exe_path)
+    lib_source = Path.join([install_path, "share", "mix2nix-build.nix"])
 
     entries =
       locks
@@ -143,19 +84,19 @@ defmodule Mix2nix do
 
     case State.format(entries) do
       {:ok, entries} ->
-        unless Keyword.get(switches, :no_write_lib) do
-          File.copy!(lib_source, libfile)
+        if opts.write_lib do
+          File.copy!(lib_source, opts.libfile)
         end
 
-        libfile_relpath = Path.relative_to(libfile, pkgdir)
-        depfile_relpath = Path.relative_to(depfile, pkgdir)
+        libfile_relpath = Path.relative_to(opts.libfile, opts.pkgdir)
+        depfile_relpath = Path.relative_to(opts.depfile, opts.pkgdir)
 
-        unless Keyword.get(switches, :no_write_dep) do
-          File.write!(depfile, entries)
+        if opts.write_deps do
+          File.write!(opts.depfile, entries)
         end
 
-        unless Keyword.get(switches, :no_write_pkg) do
-          File.write!(pkgfile, """
+        if opts.write_pkg do
+          File.write!(opts.pkgfile, """
           { pkgs ? import <nixpkgs> {}, callPackage ? pkgs.callPackage, ... }@args:
           let
             mix2nix-build = callPackage (./. + "/#{libfile_relpath}") {};
@@ -163,9 +104,9 @@ defmodule Mix2nix do
             unusedArgs = builtins.removeAttrs args ["pkgs" "callPackage"];
           in
             mix2nix-build ({
-              name = "#{name}";
-              version = "#{version}";
-              src = #{src};
+              name = "#{opts.name}";
+              version = "#{opts.version}";
+              src = #{opts.src};
               inherit mixDeps;
             } // unusedArgs)
           """)
@@ -200,9 +141,4 @@ defmodule Mix2nix do
        inspect(unparseable_lock)
      }"}
   end
-
-  defp ensure_successful_cmd({retval, 0}, _cmd), do: retval
-
-  defp ensure_successful_cmd({_, _failed}, cmd),
-    do: raise(RuntimeError, message: "The command #{cmd} failed")
 end
